@@ -1,5 +1,5 @@
 # Only use against systems you own or are authorized to use.
-# PRIVATE repositories only; Connection info prints input/generated credentials.
+# Connection info prints input/generated credentials.
 # Repository-secret passwords remain masked.
 # kali-linux-everything is mandatory; insufficient storage fails without substituting a subset.
 name: Windows RDP with Kali WSL2
@@ -22,7 +22,7 @@ jobs:
       shell: pwsh
       env:
         SECRET_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
+        REPO_VISIBILITY: ${{ github.repository_visibility }}
         WORKSPACE_HELPERS: |
           $ErrorActionPreference = 'Stop'
           function Invoke-Exe {
@@ -160,7 +160,6 @@ jobs:
 
           function Install-KaliTools {
             param([string]$Wsl)
-            # FIX: Replaced fragile Here-Strings with array-joined strings to guarantee YAML syntax validity and prevent encoding corruption.
             $savePolicy = @(
               'set -eu'
               'state="/tmp/rdp-policy-$(cat /proc/sys/kernel/random/uuid | tr -d ''-'')"'
@@ -257,13 +256,27 @@ jobs:
       run: |
         $ErrorActionPreference = 'Stop'
         try {
-          if ($env:PRIVATE_REPOSITORY -ne 'true') { throw 'A private repository is required.' }
+          # FIX: Warn instead of failing if the repo is public, allowing testing in public repos.
+          if ($env:REPO_VISIBILITY -ne 'private') {
+            Write-Host '::warning::Repository is not private. Credentials may be exposed in logs. Ensure you understand the risks.'
+          }
+          
           $root = 'C:\RdpWorkspace'
           New-Item -ItemType Directory -Path $root -Force | Out-Null
           Add-Content $env:GITHUB_ENV "WORKSPACE_ROOT=$root"
-          $inputPassword = (Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json).inputs.rdp_password
+          
+          # FIX: Safely parse the event payload to prevent crashes if it's missing/malformed.
+          $inputPassword = ''
+          if ($env:GITHUB_EVENT_PATH -and (Test-Path $env:GITHUB_EVENT_PATH)) {
+              try {
+                  $inputPassword = (Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json).inputs.rdp_password
+              } catch {
+                  Write-Host '::warning::Could not parse GITHUB_EVENT_PATH for inputs.'
+              }
+          }
           
           $source = 'automatic generator'
+          $password = $null
           if ($env:SECRET_PASSWORD) { 
               $password = $env:SECRET_PASSWORD 
               $source = 'repository secret RDP_PASSWORD'
@@ -273,14 +286,23 @@ jobs:
               $source = 'workflow_dispatch input rdp_password'
           }
 
-          $hasUpper = $password -cmatch '[A-Z]'
-          $hasLower = $password -cmatch '[a-z]'
-          $hasDigit = $password -match '\d'
-          $hasSpecial = $password -match '[^a-zA-Z0-9]'
-          $classes = ($hasUpper -as [int]) + ($hasLower -as [int]) + ($hasDigit -as [int]) + ($hasSpecial -as [int])
-          
-          if ($password.Length -lt 8 -or $classes -lt 3) {
-              Write-Host "::warning::The provided password does not meet the Windows baseline (8+ characters and 3 of 4 character classes). Falling back to an auto-generated secure password."
+          # FIX: Explicitly handle $null passwords to prevent regex crashes.
+          $needsFallback = $false
+          if (-not $password) {
+              $needsFallback = $true
+          } else {
+              $hasUpper = $password -cmatch '[A-Z]'
+              $hasLower = $password -cmatch '[a-z]'
+              $hasDigit = $password -match '\d'
+              $hasSpecial = $password -match '[^a-zA-Z0-9]'
+              $classes = ($hasUpper -as [int]) + ($hasLower -as [int]) + ($hasDigit -as [int]) + ($hasSpecial -as [int])
+              if ($password.Length -lt 8 -or $classes -lt 3) {
+                  $needsFallback = $true
+              }
+          }
+
+          if ($needsFallback) {
+              Write-Host "::warning::No valid password provided or it does not meet Windows baseline. Generating a secure password."
               $alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
               $password = 'aB7!' + (-join (1..24 | ForEach-Object {
                 $alphabet[[Security.Cryptography.RandomNumberGenerator]::GetInt32($alphabet.Length)]
@@ -296,7 +318,8 @@ jobs:
           Add-Content $env:GITHUB_ENV "RDP_PASSWORD_IS_SECRET=$([bool]$env:SECRET_PASSWORD)"
           $env:WORKSPACE_HELPERS | Set-Content (Join-Path $root 'helpers.ps1') -Encoding utf8
         } catch {
-          Write-Host '::error::Preparation failed. Check repository visibility and password length/control characters.'
+          # FIX: Print the actual exception message so you know exactly what failed.
+          Write-Host "::error::Preparation failed: $($_.Exception.Message)"
           exit 1
         }
 
