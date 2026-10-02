@@ -1,6 +1,6 @@
 # Only use against systems you own or are authorized to use.
 # PRIVATE repositories only; Connection info prints input/generated credentials.
-# Repository-secret passwords remain masked. No PowerShell here-strings are used in the main run blocks to avoid YAML parsing issues.
+# Repository-secret passwords remain masked.
 # kali-linux-everything is mandatory; insufficient storage fails without substituting a subset.
 name: Windows RDP with Kali WSL2
 'on':
@@ -160,33 +160,34 @@ jobs:
 
           function Install-KaliTools {
             param([string]$Wsl)
-            # FIX: Use PowerShell Here-Strings (@' ... '@) to prevent smart-quote encoding corruption.
-            # Let Bash natively generate the state directory to avoid empty variable mkdir failures.
-            $savePolicy = @'
-set -eu
-state="/tmp/rdp-policy-$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
-mkdir -p "$state"
-if [ -e /usr/sbin/policy-rc.d ] || [ -L /usr/sbin/policy-rc.d ]; then
-  mv /usr/sbin/policy-rc.d "$state/original"
-fi
-touch "$state/replace-ready"
-printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
-chmod 755 /usr/sbin/policy-rc.d
-'@
-            $restorePolicy = @'
-set -eu
-state=$(ls -td /tmp/rdp-policy-* 2>/dev/null | head -n 1)
-if [ -n "$state" ] && [ -d "$state" ]; then
-  if [ -e "$state/original" ] || [ -L "$state/original" ]; then
-    rm -f /usr/sbin/policy-rc.d
-    mv "$state/original" /usr/sbin/policy-rc.d
-  elif [ -f "$state/replace-ready" ]; then
-    rm -f /usr/sbin/policy-rc.d
-  fi
-  rm -f "$state/replace-ready"
-  rm -rf "$state"
-fi
-'@
+            # FIX: Replaced fragile Here-Strings with array-joined strings to guarantee YAML syntax validity and prevent encoding corruption.
+            $savePolicy = @(
+              'set -eu'
+              'state="/tmp/rdp-policy-$(cat /proc/sys/kernel/random/uuid | tr -d ''-'')"'
+              'mkdir -p "$state"'
+              'if [ -e /usr/sbin/policy-rc.d ] || [ -L /usr/sbin/policy-rc.d ]; then'
+              '  mv /usr/sbin/policy-rc.d "$state/original"'
+              'fi'
+              'touch "$state/replace-ready"'
+              'printf ''#!/bin/sh\nexit 101\n'' > /usr/sbin/policy-rc.d'
+              'chmod 755 /usr/sbin/policy-rc.d'
+            ) -join "`n"
+            
+            $restorePolicy = @(
+              'set -eu'
+              'state=$(ls -td /tmp/rdp-policy-* 2>/dev/null | head -n 1)'
+              'if [ -n "$state" ] && [ -d "$state" ]; then'
+              '  if [ -e "$state/original" ] || [ -L "$state/original" ]; then'
+              '    rm -f /usr/sbin/policy-rc.d'
+              '    mv "$state/original" /usr/sbin/policy-rc.d'
+              '  elif [ -f "$state/replace-ready" ]; then'
+              '    rm -f /usr/sbin/policy-rc.d'
+              '  fi'
+              '  rm -f "$state/replace-ready"'
+              '  rm -rf "$state"'
+              'fi'
+            ) -join "`n"
+
             $apt = @('-d', 'kali-linux', '-u', 'root', '--', 'env', 'DEBIAN_FRONTEND=noninteractive', 'NEEDRESTART_MODE=a', 'apt-get', '-o', 'APT::Install-Recommends=true', '-o', 'Acquire::Retries=3', '-o', 'Acquire::http::Timeout=30', '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold')
             $setupError = $null
             try {
@@ -220,32 +221,32 @@ fi
 
           function Configure-KaliLaunch {
             param([string]$Wsl)
-            $configureOobe = @'
-import re
-from pathlib import Path
-p = Path('/etc/wsl-distribution.conf')
-lines = p.read_text().splitlines(keepends=True) if p.exists() else []
-result = []
-in_oobe = False
-found_oobe = False
-for line in lines:
-    section = re.match(r'^\s*\[([^]]+)\]', line)
-    if section:
-        in_oobe = section.group(1).strip().lower() == 'oobe'
-        result.append(line if line.endswith('\n') else line + '\n')
-        if in_oobe:
-            found_oobe = True
-            result.append('defaultUid=0\n')
-        continue
-    if in_oobe and re.match(r'^\s*(command|defaultUid)\s*=', line, re.I):
-        continue
-    result.append(line)
-if not found_oobe:
-    if result and not result[-1].endswith('\n'):
-        result[-1] += '\n'
-    result.extend(['\n[oobe]\n', 'defaultUid=0\n'])
-p.write_text(''.join(result))
-'@
+            $configureOobe = @(
+              'import re'
+              'from pathlib import Path'
+              'p = Path(''/etc/wsl-distribution.conf'')'
+              'lines = p.read_text().splitlines(keepends=True) if p.exists() else []'
+              'result = []'
+              'in_oobe = False'
+              'found_oobe = False'
+              'for line in lines:'
+              '    section = re.match(r''^\s*\[([^]]+)\]'', line)'
+              '    if section:'
+              '        in_oobe = section.group(1).strip().lower() == ''oobe'''
+              '        result.append(line if line.endswith(''\n'') else line + ''\n'')'
+              '        if in_oobe:'
+              '            found_oobe = True'
+              '            result.append(''defaultUid=0\n'')'
+              '        continue'
+              '    if in_oobe and re.match(r''^\s*(command|defaultUid)\s*='', line, re.I):'
+              '        continue'
+              '    result.append(line)'
+              'if not found_oobe:'
+              '    if result and not result[-1].endswith(''\n''):'
+              '        result[-1] += ''\n'''
+              '    result.extend([''\n[oobe]\n'', ''defaultUid=0\n''])'
+              'p.write_text(''''.join(result))'
+            ) -join "`n"
             Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'python3', '-c', $configureOobe) 30
             Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'bash', '-lc', 'printf "[user]\ndefault=root\n[boot]\nsystemd=false\n" > /etc/wsl.conf') 30
             Invoke-Exe $Wsl @('--terminate', 'kali-linux') 30
