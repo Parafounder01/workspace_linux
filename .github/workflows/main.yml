@@ -1,680 +1,133 @@
-# Only use against systems you own or are authorized to use.
-# Connection info prints input/generated credentials.
-# Repository-secret passwords remain masked.
-# kali-linux-everything is mandatory; insufficient storage fails without substituting a subset.
-name: Windows RDP with Kali WSL2
-'on':
+name: win 11 + tailscale + Download.bat script 
+
+on:
   workflow_dispatch:
-    inputs:
-      rdp_password:
-        description: Optional password; RDP_PASSWORD secret takes precedence
-        required: false
-        type: string
-        default: ''
-permissions: {}
+
 jobs:
-  desktop:
+  secure-rdp:
     runs-on: windows-2022
     timeout-minutes: 350
+
     steps:
-    - name: Prepare helpers and password
-      timeout-minutes: 3
-      shell: pwsh
-      env:
-        SECRET_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        REPO_VISIBILITY: ${{ github.repository_visibility }}
-        WORKSPACE_HELPERS: |
-          $ErrorActionPreference = 'Stop'
-          function Invoke-Exe {
-            param([string]$File, [string[]]$Arguments, [int]$Seconds = 120)
-            $si = [Diagnostics.ProcessStartInfo]::new()
-            $si.FileName = $File
-            $si.UseShellExecute = $false
-            $si.RedirectStandardOutput = $true
-            $si.RedirectStandardError = $true
-            $si.RedirectStandardInput = $true
-            foreach ($arg in $Arguments) { $si.ArgumentList.Add($arg) }
-            $p = [Diagnostics.Process]::new()
-            $p.StartInfo = $si
-            try {
-              if (-not $p.Start()) { throw 'Process did not start.' }
-              $p.StandardInput.Close()
-              $stdout = $p.StandardOutput.ReadToEndAsync()
-              $stderr = $p.StandardError.ReadToEndAsync()
-              if (-not $p.WaitForExit($Seconds * 1000)) {
-                $p.Kill($true)
-                throw "Process exceeded $Seconds seconds."
-              }
-              $output = ($stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()).Replace("`0", '')
-              if ($p.ExitCode -ne 0) {
-                $failure = [InvalidOperationException]::new("Process exited with code $($p.ExitCode): $output")
-                $failure.Data['ExitCode'] = $p.ExitCode
-                throw $failure
-              }
-              return $output
-            } finally { $p.Dispose() }
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+         
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           }
-          function Invoke-RdpTask {
-            param([string]$Script, [int]$Seconds = 2400)
-            $root = 'C:\RdpWorkspace'
-            $credential = Import-Clixml (Join-Path $root 'credential.xml')
-            $id = [guid]::NewGuid().ToString('N')
-            $taskName = "Kali-$id"
-            $body = Join-Path $root "$id.ps1"
-            $wrapper = Join-Path $root "$id-wrapper.ps1"
-            $log = Join-Path $root "$id.log"
-            $result = Join-Path $root "$id.result"
-            Set-Content $body $Script -Encoding utf8
-            $wrapperText = @(
-              '$ErrorActionPreference = ''Stop'''
-              'try {'
-              ('  & ''{0}'' *> ''{1}''' -f $body, $log)
-              ('  Set-Content ''{0}'' ''0''' -f $result)
-              '} catch {'
-              ('  Add-Content ''{0}'' ($_ | Out-String)' -f $log)
-              ('  Set-Content ''{0}'' ''1''' -f $result)
-              '  exit 1'
-              '}'
-            ) -join "`n"
-            Set-Content $wrapper $wrapperText -Encoding utf8
-            $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
-            $action = New-ScheduledTaskAction -Execute $pwsh -Argument ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $wrapper)
-            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds ($Seconds + 30))
-            try {
-              Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings -User "$env:COMPUTERNAME\rdp" -Password $credential.GetNetworkCredential().Password -RunLevel Highest -Force | Out-Null
-              Start-ScheduledTask -TaskName $taskName
-              $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
-              $heartbeat = [DateTime]::UtcNow
-              $launchCheck = [DateTime]::UtcNow.AddSeconds(15)
-              while (-not (Test-Path $result)) {
-                if ([DateTime]::UtcNow -ge $heartbeat) {
-                  Write-Host 'Waiting for Kali task under the rdp account...'
-                  $heartbeat = [DateTime]::UtcNow.AddSeconds(60)
-                }
-                if ([DateTime]::UtcNow -ge $launchCheck -and (Get-ScheduledTask -TaskName $taskName).State -eq 'Ready' -and -not (Test-Path $result)) {
-                  throw 'Scheduled task stopped without a result; check task logon and PowerShell availability.'
-                }
-                if ([DateTime]::UtcNow -ge $deadline) { throw 'Kali task timed out; inspect its log.' }
-                Start-Sleep -Seconds 5
-              }
-              if ((Get-Content $result -Raw).Trim() -ne '0') { throw 'Kali task failed; see its log.' }
-            } finally {
-              if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-                Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-              }
-              if (Test-Path $log) { Get-Content $log | ForEach-Object { Write-Host $_ } }
-            }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+         
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+         
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-          function Initialize-WorkspaceWsl {
-            param([string]$Wsl)
-            try { Invoke-Exe $Wsl @('--status') }
-            catch {
-              if ($_.Exception.Message -notmatch '(?i)WSL 2 kernel file is not found|WSL_E_KERNEL_NOT_FOUND') { throw }
-              Write-Host '::warning::WSL2 kernel is missing; attempting the supported WSL update.'
-            }
-            foreach ($name in @('Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform')) {
-              $feature = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction Stop
-              if ($feature.State -match 'Pending') { throw "Windows feature $name requires a reboot. This hosted job cannot continue." }
-              if ($feature.State -ne 'Enabled') { throw "Required Windows feature $name is not enabled. Use a runner with WSL2 prerequisites enabled." }
-            }
-            try { $updateOutput = Invoke-Exe $Wsl @('--update') 600 }
-            catch {
-              if ($_.Exception.Data['ExitCode'] -in @(3010, 1641) -or $_.Exception.Message -match '(?i)reboot|restart (?:your |the )?(?:computer|machine|system)') { throw 'WSL update requires a reboot. This hosted job cannot continue.' }
-              Write-Host '::warning::Standard WSL update failed; trying --web-download.'
-              try { $updateOutput = Invoke-Exe $Wsl @('--update', '--web-download') 600 }
-              catch {
-                if ($_.Exception.Data['ExitCode'] -in @(3010, 1641) -or $_.Exception.Message -match '(?i)reboot|restart (?:your |the )?(?:computer|machine|system)') { throw 'WSL update requires a reboot. This hosted job cannot continue.' }
-                throw
-              }
-            }
-            Write-Host $updateOutput
-            if ($updateOutput -match '(?i)reboot|restart (?:your |the )?(?:computer|machine|system)') { throw 'WSL update requires a reboot. This hosted job cannot continue.' }
-            $versionText = Invoke-Exe $Wsl @('--version')
-            Write-Host $versionText
-            $match = [regex]::Match($versionText, '(?im)^\s*WSL\s+version\s*:\s*(\d+\.\d+\.\d+(?:\.\d+)?)')
-            if (-not $match.Success -or [version]$match.Groups[1].Value -lt [version]'2.4.4') { throw 'WSL 2.4.4 or newer is required after updating.' }
-            Invoke-Exe $Wsl @('--set-default-version', '2')
-            $status = Invoke-Exe $Wsl @('--status')
-            Write-Host $status
-            if ($status -notmatch '(?im)^\s*Default Version:\s*2\s*$') { throw 'WSL did not confirm default version 2 after updating.' }
-          }
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+         
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          function Show-TailscaleDiagnostic {
-            $cli = 'C:\Program Files\Tailscale\tailscale.exe'
-            if (Test-Path -LiteralPath $cli) { Invoke-Exe $cli @('status') 20 }
-            else { Write-Host 'Tailscale installation not reached or did not complete; CLI is absent.' }
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+         
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
-          function Show-KaliDiagnostic {
-            param([string]$Outcome)
-            if ($Outcome -ne 'success') { Write-Host "Kali installation not reached or did not complete (step outcome: $Outcome)."; return }
-            $script = @(
-              '. ''C:\RdpWorkspace\helpers.ps1'''
-              'Invoke-Exe ''wsl.exe'' @(''--status'') 20'
-              'Invoke-Exe ''wsl.exe'' @(''-l'', ''-v'') 20'
-            ) -join "`n"
-            Invoke-RdpTask -Seconds 60 -Script $script
+         
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
           }
-
-          function Install-KaliTools {
-            param([string]$Wsl)
-            $savePolicy = @(
-              'set -eu'
-              'state="/tmp/rdp-policy-$(cat /proc/sys/kernel/random/uuid | tr -d ''-'')"'
-              'mkdir -p "$state"'
-              'if [ -e /usr/sbin/policy-rc.d ] || [ -L /usr/sbin/policy-rc.d ]; then'
-              '  mv /usr/sbin/policy-rc.d "$state/original"'
-              'fi'
-              'touch "$state/replace-ready"'
-              'printf ''#!/bin/sh\nexit 101\n'' > /usr/sbin/policy-rc.d'
-              'chmod 755 /usr/sbin/policy-rc.d'
-            ) -join "`n"
-            
-            $restorePolicy = @(
-              'set -eu'
-              'state=$(ls -td /tmp/rdp-policy-* 2>/dev/null | head -n 1)'
-              'if [ -n "$state" ] && [ -d "$state" ]; then'
-              '  if [ -e "$state/original" ] || [ -L "$state/original" ]; then'
-              '    rm -f /usr/sbin/policy-rc.d'
-              '    mv "$state/original" /usr/sbin/policy-rc.d'
-              '  elif [ -f "$state/replace-ready" ]; then'
-              '    rm -f /usr/sbin/policy-rc.d'
-              '  fi'
-              '  rm -f "$state/replace-ready"'
-              '  rm -rf "$state"'
-              'fi'
-            ) -join "`n"
-
-            $apt = @('-d', 'kali-linux', '-u', 'root', '--', 'env', 'DEBIAN_FRONTEND=noninteractive', 'NEEDRESTART_MODE=a', 'apt-get', '-o', 'APT::Install-Recommends=true', '-o', 'Acquire::Retries=3', '-o', 'Acquire::http::Timeout=30', '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold')
-            $setupError = $null
-            try {
-              Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'bash', '-lc', $savePolicy) 30
-              Invoke-Exe $Wsl ($apt + @('-o', 'APT::Update::Error-Mode=any', 'update')) 900
-              Invoke-Exe $Wsl ($apt + @('-y', 'install', 'python3-apt')) 900
-              $planner = 'import apt,apt_pkg,json; apt_pkg.config.set("APT::Install-Recommends","true"); c=apt.Cache(); c["kali-linux-everything"].mark_install(); print(json.dumps({"download":c.required_download,"installed":c.required_space}))'
-              $plan = (Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'python3', '-c', $planner) 180) | ConvertFrom-Json
-              if ($null -eq $plan.download -or $null -eq $plan.installed -or [double]$plan.download -lt 0) { throw 'APT did not return a valid disk estimate.' }
-              $required = [Math]::Max(0, [double]$plan.installed) + [double]$plan.download + 8GB
-              $available = [double](Get-PSDrive -Name C -ErrorAction Stop).Free
-              Write-Host ('Kali everything: estimated requirement including 8 GiB reserve: {0:N1} GiB; host free: {1:N1} GiB.' -f ($required / 1GB), ($available / 1GB))
-              if ($available -lt $required) { throw ('Insufficient disk for kali-linux-everything: need approximately {0:N1} GiB, have {1:N1} GiB. Use a Windows runner with more storage.' -f ($required / 1GB), ($available / 1GB)) }
-              Invoke-Exe $Wsl ($apt + @('-y', 'install', 'kali-linux-everything')) 7200
-              $packageState = Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'dpkg-query', '-W', '-f=${Status}', 'kali-linux-everything')
-              if ($packageState.Trim() -ne 'install ok installed') { throw 'kali-linux-everything is not fully installed.' }
-              Invoke-Exe $Wsl ($apt + @('check')) 120
-              Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'bash', '-lc', 'command -v nmap && command -v msfconsole && command -v sqlmap && command -v hashcat && command -v tshark')
-              Invoke-Exe $Wsl ($apt + @('clean')) 120
-            } catch {
-              $setupError = $_
-            } finally {
-              try { Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'bash', '-lc', $restorePolicy) 30 }
-              catch {
-                if ($setupError) { Write-Host '::warning::Restoring package service policy also failed; preserving the original setup error.' }
-                else { throw }
-              }
-            }
-            if ($setupError) { throw $setupError }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+     
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+         
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
+          Write-Host "TCP connectivity successful!"
 
-          function Configure-KaliLaunch {
-            param([string]$Wsl)
-            $configureOobe = @(
-              'import re'
-              'from pathlib import Path'
-              'p = Path(''/etc/wsl-distribution.conf'')'
-              'lines = p.read_text().splitlines(keepends=True) if p.exists() else []'
-              'result = []'
-              'in_oobe = False'
-              'found_oobe = False'
-              'for line in lines:'
-              '    section = re.match(r''^\s*\[([^]]+)\]'', line)'
-              '    if section:'
-              '        in_oobe = section.group(1).strip().lower() == ''oobe'''
-              '        result.append(line if line.endswith(''\n'') else line + ''\n'')'
-              '        if in_oobe:'
-              '            found_oobe = True'
-              '            result.append(''defaultUid=0\n'')'
-              '        continue'
-              '    if in_oobe and re.match(r''^\s*(command|defaultUid)\s*='', line, re.I):'
-              '        continue'
-              '    result.append(line)'
-              'if not found_oobe:'
-              '    if result and not result[-1].endswith(''\n''):'
-              '        result[-1] += ''\n'''
-              '    result.extend([''\n[oobe]\n'', ''defaultUid=0\n''])'
-              'p.write_text(''''.join(result))'
-            ) -join "`n"
-            Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'python3', '-c', $configureOobe) 30
-            Invoke-Exe $Wsl @('-d', 'kali-linux', '-u', 'root', '--', 'bash', '-lc', 'printf "[user]\ndefault=root\n[boot]\nsystemd=false\n" > /etc/wsl.conf') 30
-            Invoke-Exe $Wsl @('--terminate', 'kali-linux') 30
-            Invoke-Exe $Wsl @('-d', 'kali-linux') 30
-            $uid = Invoke-Exe $Wsl @('-d', 'kali-linux', '--', 'id', '-u') 30
-            if ($uid.Trim() -ne '0') { throw 'Kali default launch did not select root.' }
-          }
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          # FIX: Warn instead of failing if the repo is public, allowing testing in public repos.
-          if ($env:REPO_VISIBILITY -ne 'private') {
-            Write-Host '::warning::Repository is not private. Credentials may be exposed in logs. Ensure you understand the risks.'
-          }
-          
-          $root = 'C:\RdpWorkspace'
-          New-Item -ItemType Directory -Path $root -Force | Out-Null
-          Add-Content $env:GITHUB_ENV "WORKSPACE_ROOT=$root"
-          
-          # FIX: Safely parse the event payload to prevent crashes if it's missing/malformed.
-          $inputPassword = ''
-          if ($env:GITHUB_EVENT_PATH -and (Test-Path $env:GITHUB_EVENT_PATH)) {
-              try {
-                  $inputPassword = (Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json).inputs.rdp_password
-              } catch {
-                  Write-Host '::warning::Could not parse GITHUB_EVENT_PATH for inputs.'
-              }
-          }
-          
-          $source = 'automatic generator'
-          $password = $null
-          if ($env:SECRET_PASSWORD) { 
-              $password = $env:SECRET_PASSWORD 
-              $source = 'repository secret RDP_PASSWORD'
-          }
-          elseif ($inputPassword) { 
-              $password = $inputPassword 
-              $source = 'workflow_dispatch input rdp_password'
-          }
+      - name: Maintain Connection + Watch RDP User
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
 
-          # FIX: Explicitly handle $null passwords to prevent regex crashes.
-          $needsFallback = $false
-          if (-not $password) {
-              $needsFallback = $true
-          } else {
-              $hasUpper = $password -cmatch '[A-Z]'
-              $hasLower = $password -cmatch '[a-z]'
-              $hasDigit = $password -match '\d'
-              $hasSpecial = $password -match '[^a-zA-Z0-9]'
-              $classes = ($hasUpper -as [int]) + ($hasLower -as [int]) + ($hasDigit -as [int]) + ($hasSpecial -as [int])
-              if ($password.Length -lt 8 -or $classes -lt 3) {
-                  $needsFallback = $true
-              }
-          }
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
 
-          if ($needsFallback) {
-              Write-Host "::warning::No valid password provided or it does not meet Windows baseline. Generating a secure password."
-              $alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
-              $password = 'aB7!' + (-join (1..24 | ForEach-Object {
-                $alphabet[[Security.Cryptography.RandomNumberGenerator]::GetInt32($alphabet.Length)]
-              }))
-              $source = 'automatic generator (fallback)'
-          }
-
-          if ($password.Length -gt 127 -or $password -match '[\x00-\x1f\x7f]') { throw 'Password must be at most 127 characters and contain no control characters.' }
-          $credential = [pscredential]::new('rdp', (ConvertTo-SecureString $password -AsPlainText -Force))
-          $credential | Export-Clixml (Join-Path $root 'credential.xml')
-          Add-Content $env:GITHUB_ENV "RDP_PASSWORD_SOURCE=$source"
-          Add-Content $env:GITHUB_ENV "RDP_PASSWORD=$password"
-          Add-Content $env:GITHUB_ENV "RDP_PASSWORD_IS_SECRET=$([bool]$env:SECRET_PASSWORD)"
-          $env:WORKSPACE_HELPERS | Set-Content (Join-Path $root 'helpers.ps1') -Encoding utf8
-        } catch {
-          # FIX: Print the actual exception message so you know exactly what failed.
-          Write-Host "::error::Preparation failed: $($_.Exception.Message)"
-          exit 1
-        }
-
-    - name: Create RDP user and enable native RDP
-      timeout-minutes: 3
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          $stage = 'Load credential and verify administrator privileges'
-          $credential = Import-Clixml 'C:\RdpWorkspace\credential.xml'
-          $plainPassword = $credential.GetNetworkCredential().Password
-          $hasUpper = $plainPassword -cmatch '[A-Z]'
-          $hasLower = $plainPassword -cmatch '[a-z]'
-          $hasDigit = $plainPassword -match '\d'
-          $hasSpecial = $plainPassword -match '[^a-zA-Z0-9]'
-          if ($plainPassword.Length -lt 8 -or (($hasUpper + $hasLower + $hasDigit + $hasSpecial) -lt 3)) {
-            throw "The selected password does not meet the common Windows baseline (8+ characters and 3 of 4 character classes). Source: $env:RDP_PASSWORD_SOURCE."
-          }
-          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'This step requires an elevated administrator process.' }
-          Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction Stop
-          
-          $stage = 'Create or update local rdp account'
-          $user = Get-LocalUser | Where-Object { $_.Name -eq 'rdp' }
-          if ($user) { Set-LocalUser -Name rdp -Password $credential.Password -PasswordNeverExpires $true -AccountNeverExpires }
-          else { New-LocalUser -Name rdp -Password $credential.Password -PasswordNeverExpires -AccountNeverExpires | Out-Null }
-          Enable-LocalUser -Name rdp
-          $user = Get-LocalUser -Name rdp -ErrorAction Stop
-          if (-not $user.Enabled) { throw 'The rdp account is disabled.' }
-          
-          $stage = 'Grant local group memberships'
-          foreach ($sid in @('S-1-5-32-544', 'S-1-5-32-555')) {
-            $group = Get-LocalGroup -SID $sid -ErrorAction Stop
-            $members = @(Get-LocalGroupMember -Group $group -ErrorAction Stop)
-            if ($user.SID.Value -notin @($members | ForEach-Object { $_.SID.Value })) { Add-LocalGroupMember -Group $group -Member $user -ErrorAction Stop }
-          }
-          
-          $stage = 'Enable native RDP and verify the listener'
-          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-          Start-Service TermService
-          $deadline = [DateTime]::UtcNow.AddSeconds(60)
-          while (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
-            if ([DateTime]::UtcNow -ge $deadline) { throw 'Native RDP is not listening on TCP 3389.' }
-            Start-Sleep -Seconds 2
-          }
-          & netstat.exe -ano | & findstr.exe ':3389'
-          if ($LASTEXITCODE -ne 0) { throw 'netstat did not find port 3389.' }
-        } catch {
-          $message = $_.Exception.Message
-          if ($credential) {
-            $plain = $credential.GetNetworkCredential().Password
-            if ($plain) { $message = $message.Replace($plain, '[REDACTED]') }
-          }
-          $detail = ('{0}: {1} [ErrorId: {2}]' -f $stage, $message, $_.FullyQualifiedErrorId)
-          $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-          Write-Host "::error::$detail"
-          Write-Host "Password source selected: $env:RDP_PASSWORD_SOURCE. If this was a Windows password-policy rejection, replace that source with a longer password containing uppercase, lowercase, digits, and symbols."
-          exit 1
-        }
-
-    - name: Verify and update WSL
-      timeout-minutes: 25
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          . "$env:WORKSPACE_ROOT\helpers.ps1"
-          $wsl = (Get-Command wsl.exe -ErrorAction Stop).Source
-          Initialize-WorkspaceWsl -Wsl $wsl
-        } catch {
-          $message = $_.Exception.Message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-          Write-Host "::error::WSL initialization failed: $message"
-          exit 1
-        }
-
-    - name: Install Kali and tools for the RDP user
-      timeout-minutes: 185
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-        KALI_SCRIPT: |
-          . 'C:\RdpWorkspace\helpers.ps1'
-          $wsl = 'C:\Windows\System32\wsl.exe'
-          Invoke-Exe $wsl @('--status')
-          Invoke-Exe $wsl @('--set-default-version', '2')
-          Invoke-Exe $wsl @('--install', '--distribution', 'kali-linux', '--web-download', '--no-launch') 900
-          Invoke-Exe $wsl @('-d', 'kali-linux', '-u', 'root', '--', 'true') 180
-          Invoke-Exe $wsl @('--set-default', 'kali-linux')
-          Invoke-Exe $wsl @('-d', 'kali-linux', '-u', 'root', '--', 'bash', '-lc', 'printf "[user]\ndefault=root\n[boot]\nsystemd=false\n" > /etc/wsl.conf')
-          Invoke-Exe $wsl @('--terminate', 'kali-linux')
-          Install-KaliTools -Wsl $wsl
-          Configure-KaliLaunch -Wsl $wsl
-          Invoke-Exe $wsl @('--list', '--verbose')
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          . "$env:WORKSPACE_ROOT\helpers.ps1"
-          Invoke-RdpTask -Script $env:KALI_SCRIPT -Seconds 10800
-        } catch {
-          Write-Host '::error::Kali setup failed for the rdp account. Review the task log above for the exact error, including disk requirements.'
-          exit 1
-        }
-      id: kali_setup
-
-    - name: Install and verify MobaXterm
-      timeout-minutes: 10
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          $zip = "$env:WORKSPACE_ROOT\MobaXterm.zip"
-          $folder = "$env:WORKSPACE_ROOT\MobaXterm"
-          Invoke-WebRequest -Uri 'https://download.mobatek.net/2652026082870834/MobaXterm_Installer_v26.5.zip' -OutFile $zip -TimeoutSec 300
-          Expand-Archive -LiteralPath $zip -DestinationPath $folder -Force
-          $msi = @(Get-ChildItem $folder -Recurse -Filter 'MobaXterm_installer_26.5.msi')
-          if ($msi.Count -ne 1) { throw 'Expected exactly one MobaXterm MSI.' }
-          if (-not (Test-Path (Join-Path $msi[0].DirectoryName 'MobaXterm_installer.dat'))) { throw 'MobaXterm companion .dat is missing.' }
-          $p = Start-Process msiexec.exe -ArgumentList '/i','MobaXterm_installer_26.5.msi','/qn','/norestart' -WorkingDirectory $msi[0].DirectoryName -Wait -NoNewWindow -PassThru
-          if ($p.ExitCode -notin @(0, 3010)) { throw "MobaXterm MSI failed: $($p.ExitCode)." }
-          if (-not (Test-Path 'C:\Program Files (x86)\Mobatek\MobaXterm\MobaXterm.exe')) { throw 'MobaXterm executable is missing after installation.' }
-        } catch {
-          Write-Host "::error::MobaXterm setup failed: $($_.Exception.Message)"
-          exit 1
-        }
-
-    - name: Install and verify Tailscale
-      timeout-minutes: 10
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          $msi = "$env:WORKSPACE_ROOT\Tailscale.msi"
-          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi -TimeoutSec 300
-          $p = Start-Process msiexec.exe -ArgumentList ('/i "{0}" /qn /norestart' -f $msi) -Wait -NoNewWindow -PassThru
-          if ($p.ExitCode -notin @(0, 3010)) { throw "Tailscale MSI failed: $($p.ExitCode)." }
-          if (-not (Test-Path 'C:\Program Files\Tailscale\tailscale.exe')) { throw 'Tailscale CLI missing.' }
-          $service = Get-Service Tailscale -ErrorAction Stop
-          if ($service.Status -ne 'Running') { Start-Service Tailscale }
-          (Get-Service Tailscale).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
-        } catch {
-          Write-Host "::error::Tailscale setup failed: $($_.Exception.Message)"
-          exit 1
-        }
-
-    - name: Tailscale login by link
-      timeout-minutes: 12
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $process = $null
-        try {
-          . "$env:WORKSPACE_ROOT\helpers.ps1"
-          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
-          $stdout = "$env:WORKSPACE_ROOT\tailscale-up.stdout.log"
-          $stderr = "$env:WORKSPACE_ROOT\tailscale-up.stderr.log"
-          $process = Start-Process $ts -ArgumentList @('up', "--hostname=gh-win-$env:GITHUB_RUN_ID", '--accept-dns=false') -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -NoNewWindow
-          $deadline = [DateTime]::UtcNow.AddMinutes(10)
-          $printed = $false
-          $running = $false
-          while ([DateTime]::UtcNow -lt $deadline) {
-            $log = ((Get-Content $stdout, $stderr -Raw -ErrorAction SilentlyContinue) -join "`n")
-            $match = [regex]::Match($log, 'https://login\.tailscale\.com/[A-Za-z0-9/_?=&%.-]+')
-            if ($match.Success -and -not $printed) {
-              Write-Host "`n============================================================"
-              Write-Host "AUTHORIZE THIS RUNNER: $($match.Value)"
-              Write-Host "============================================================`n"
-              $notice = $match.Value.Replace('%', '%25')
-              Write-Host "::notice title=Tailscale login::$notice"
-              $printed = $true
-            }
-            try {
-              $status = (Invoke-Exe $ts @('status', '--json') 10) | ConvertFrom-Json
-              $running = $status.BackendState -eq 'Running'
-            } catch { $running = $false }
-            if ($running) { break }
-            if ($process.HasExited -and $process.ExitCode -ne 0) { throw 'tailscale up failed; inspect debug logs.' }
-            Start-Sleep -Seconds 3
-          }
-          if (-not $running) { throw 'Tailscale login timed out after 10 minutes. Open the login link and approve the device.' }
-        } catch {
-          Write-Host "::error::$($_.Exception.Message)"
-          exit 1
-        } finally {
-          if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
-        }
-
-    - name: Retrieve Tailscale IP
-      timeout-minutes: 7
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          . "$env:WORKSPACE_ROOT\helpers.ps1"
-          $ip = $null
-          for ($attempt = 0; $attempt -lt 24; $attempt++) {
-            try {
-              $candidate = (Invoke-Exe 'C:\Program Files\Tailscale\tailscale.exe' @('ip', '-4') 10).Trim()
-              $parsed = $null
-              if ([Net.IPAddress]::TryParse($candidate, [ref]$parsed) -and $parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
-                $ip = $candidate
-                break
-              }
-            } catch { }
-            Start-Sleep -Seconds 5
-          }
-          if (-not $ip) { throw 'No Tailscale IPv4 address was assigned.' }
-          Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$ip"
-        } catch {
-          Write-Host "::error::$($_.Exception.Message)"
-          exit 1
-        }
-
-    - name: Final smoke checks
-      timeout-minutes: 7
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-        KALI_SMOKE_SCRIPT: |
-          . 'C:\RdpWorkspace\helpers.ps1'
-          $state = Invoke-Exe 'wsl.exe' @('-d', 'kali-linux', '-u', 'root', '--', 'dpkg-query', '-W', '-f=${Status}', 'kali-linux-everything')
-          if ($state.Trim() -ne 'install ok installed') { throw 'Kali everything metapackage is not installed.' }
-          Invoke-Exe 'wsl.exe' @('-d', 'kali-linux', '-u', 'root', '--', 'bash', '-lc', 'command -v nmap && command -v msfconsole && command -v sqlmap && command -v hashcat && command -v tshark')
-          Invoke-Exe 'wsl.exe' @('-d', 'kali-linux') 30
-          $uid = Invoke-Exe 'wsl.exe' @('-d', 'kali-linux', '--', 'id', '-u') 30
-          if ($uid.Trim() -ne '0') { throw 'Kali default user is not root.' }
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          . "$env:WORKSPACE_ROOT\helpers.ps1"
-          if (-not (Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue)) { throw 'RDP TCP connection to the Tailscale address failed.' }
-          if (-not (Test-Path 'C:\Program Files (x86)\Mobatek\MobaXterm\MobaXterm.exe')) { throw 'MobaXterm missing.' }
-          Invoke-RdpTask -Seconds 300 -Script $env:KALI_SMOKE_SCRIPT
-        } catch {
-          Write-Host '::error::Final smoke checks failed; review output above.'
-          exit 1
-        }
-
-    - name: Connection info
-      timeout-minutes: 2
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
-          $env:RDP_PASSWORD = (Import-Clixml 'C:\RdpWorkspace\credential.xml').GetNetworkCredential().Password
-          $connection = "mstsc /v:$env:TAILSCALE_IP | Username: rdp | Password: $env:RDP_PASSWORD"
-          $token = [guid]::NewGuid().ToString('N')
-          Write-Host "::stop-commands::$token"
-          try {
-            Write-Host '============================================================'
-            Write-Host 'PRIVATE REPO: credentials appear in this log and job summary.'
-            Write-Host $connection
-            Write-Host 'open MobaXterm from the desktop Start menu; Kali WSL via wsl -d kali-linux'
-            Write-Host 'Connect the client to the same tailnet; its policy must allow TCP 3389.'
-            Write-Host 'Repository-secret passwords may display as ***; use the supplied secret.'
-            Write-Host '============================================================'
-          } finally { Write-Host "::$token::" }
-          
-          $summaryConnection = $connection
-          if ($env:RDP_PASSWORD_IS_SECRET -eq 'True') {
-            $summaryConnection = "mstsc /v:$env:TAILSCALE_IP | Username: rdp | Password: *** (use repository secret)"
-          }
-          $safe = [Net.WebUtility]::HtmlEncode($summaryConnection)
-          @(
-            '## Windows desktop connection'
-            '**PRIVATE REPO: credentials appear in logs and this summary.**'
-            ''
-            "<pre>$safe</pre>"
-            ''
-            'open MobaXterm from the desktop Start menu; Kali WSL via wsl -d kali-linux'
-            ''
-            'Connect your client to the same tailnet and allow TCP 3389 in its policy.'
-            'Repository-secret passwords may appear as ***; use the original secret.'
-            'Installed tool set: kali-linux-everything. Hardware-dependent tools still require compatible hardware and WSL support.'
-            'This disposable runner and its files are deleted when the job ends.'
-          ) | Add-Content $env:GITHUB_STEP_SUMMARY
-        } catch {
-          Write-Host '::error::Could not publish connection information.'
-          exit 1
-        }
-
-    - name: Keep alive
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-      run: |
-        $ErrorActionPreference = 'Stop'
-        try {
           while ($true) {
-            Write-Host "[$([DateTime]::UtcNow.ToString('o'))] Workspace alive | Tailscale $env:TAILSCALE_IP"
-            Start-Sleep -Seconds 300
-          }
-        } catch {
-          Write-Host '::error::Keep-alive loop failed.'
-          exit 1
-        }
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
 
-    - name: Debug diagnostics
-      if: always()
-      timeout-minutes: 5
-      shell: pwsh
-      env:
-        RDP_PASSWORD: ''
-        KALI_OUTCOME: ${{ steps.kali_setup.outcome }}
-      run: |
-        $ErrorActionPreference = 'Continue'
-        function Show-Diagnostic {
-          param([scriptblock]$Command)
-          try { & $Command } catch { Write-Host "::warning::Diagnostic failed: $($_.Exception.Message)" }
-        }
-        if (Test-Path 'C:\RdpWorkspace\helpers.ps1') {
-          . 'C:\RdpWorkspace\helpers.ps1'
-          if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
-            Show-Diagnostic { Invoke-Exe 'wsl.exe' @('--status') 20 }
-            Show-Diagnostic {
-              try { Invoke-Exe 'wsl.exe' @('-l', '-v') 20 }
-              catch {
-                if ($_.Exception.Message -match '(?i)no installed distributions|WSL_E_DEFAULT_DISTRO_NOT_FOUND') {
-                  Write-Host 'No distributions registered for the runner account; Kali is registered for rdp.'
-                } else { throw }
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+                      Write-Host "✅ Downloads.bat copied to $downloadPath"
+
+                      # Run the batch file for the first time
+                      cmd /c $downloadPath
+                      Write-Host "✅ Downloads.bat executed successfully"
+                      break
+                  }
+                  catch {
+                      Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
+                      break
+                  }
               }
-            }
-          } else { Write-Host 'WSL prerequisite unavailable; initialization was not reached.' }
-          Show-Diagnostic { Show-KaliDiagnostic -Outcome $env:KALI_OUTCOME }
-          Show-Diagnostic { Show-TailscaleDiagnostic }
-        } else { Write-Host 'Setup stopped before diagnostic helpers were created.' }
-        Show-Diagnostic { & netstat.exe -ano | & findstr.exe '3389' }
-        foreach ($name in @('TermService', 'Tailscale')) {
-          Show-Diagnostic {
-            $service = Get-Service -Name $name -ErrorAction SilentlyContinue
-            if ($service) { $service | Format-Table Name,Status,StartType }
-            else { Write-Host "$name service absent; installation not reached or did not complete." }
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+                  Start-Sleep -Seconds 30
+              }
           }
-        }
-        Show-Diagnostic {
-          Get-WinEvent -LogName 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' -MaxEvents 20 -ErrorAction Stop | Select-Object TimeCreated,Id,LevelDisplayName,Message | Format-List
-        }
-        Show-Diagnostic {
-          Get-ChildItem 'C:\RdpWorkspace\tailscale-up.*.log' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Tail 30 }
-        }
-        exit 0
+
+          # Keep runner alive
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
