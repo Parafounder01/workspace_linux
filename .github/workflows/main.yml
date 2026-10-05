@@ -76,11 +76,10 @@ jobs:
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Key must be ephemeral + tagged (tag:gh-runner). See README.
+          # Key must be ephemeral + tagged (tag:gh-runner); node inherits the tag from the key.
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=$env:TS_AUTHKEY `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID `
-            --advertise-tags=tag:gh-runner
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
 
           $tsIP = $null
           $retries = 0
