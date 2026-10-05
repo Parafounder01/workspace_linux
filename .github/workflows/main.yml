@@ -53,6 +53,24 @@ jobs:
           icacls C:\work /grant "RDP:(OI)(CI)M" | Out-Null
           Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination C:\work -Recurse -Force
 
+      - name: Enable file sharing (SMB share + RDP drive/clipboard redirection)
+        run: |
+          # RDP drive + clipboard redirection allowed
+          $rdp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Set-ItemProperty -Path $rdp -Name "fDisableCdm"  -Value 0 -Force
+          Set-ItemProperty -Path $rdp -Name "fDisableClip" -Value 0 -Force
+
+          # SMB share \\<tailscale-ip>\work -> C:\work
+          Set-Service -Name LanmanServer -StartupType Automatic
+          Start-Service -Name LanmanServer
+          if (Get-SmbShare -Name "work" -ErrorAction SilentlyContinue) { Remove-SmbShare -Name "work" -Force }
+          New-SmbShare -Name "work" -Path "C:\work" -FullAccess "RDP" | Out-Null
+
+          # SMB (445) only from Tailscale range
+          netsh advfirewall firewall delete rule name="SMB-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="SMB-Tailscale" `
+            dir=in action=allow protocol=TCP localport=445 remoteip=100.64.0.0/10
+
       - name: Install dev tools (embedded + data analysis)
         run: |
           # Embedded: ARM GCC, QEMU, VS Code, PlatformIO
@@ -106,6 +124,7 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: (secret RDP_PASSWORD)"
           Write-Host "Work dir: C:\work  (uploaded as artifact at end)"
+          Write-Host "SMB share: \\$env:TAILSCALE_IP\work  (user RDP)"
           Write-Host "Stop early: create C:\work\STOP"
           Write-Host "==================`n"
 
