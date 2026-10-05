@@ -1,133 +1,127 @@
-name: win 11 + tailscale + Download.bat script 
+name: Dev workspace (Win 2022 + Tailscale RDP, software-only)
+
+# Software-only sessions: embedded firmware build/sim + data analysis.
+# No hardware access. Anything needing a real board -> lab PC (see README.md).
 
 on:
   workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Session length in minutes (max 335)"
+        required: true
+        default: "335"
 
 jobs:
-  secure-rdp:
+  dev-workspace:
     runs-on: windows-2022
     timeout-minutes: 350
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Checkout repo into workspace
+        uses: actions/checkout@v4
+
+      - name: Configure RDP (NLA on, Tailscale-only)
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
+            -Name "fDenyTSConnections" -Value 0 -Force
+          # NLA enabled
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+            -Name "UserAuthentication" -Value 1 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+            -Name "SecurityLayer" -Value 2 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-         
-          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          # Only accept RDP from the Tailscale CGNAT range
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Fixed Password
+      - name: Create RDP user (password from secret, non-admin)
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $password = "MR.English2008"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not $env:RDP_PASSWORD) { Write-Error "Secret RDP_PASSWORD is not set"; exit 1 }
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires | Out-Null
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-         
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-         
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+
+          # Shared work dir (this is what gets uploaded at the end)
+          New-Item -ItemType Directory -Path C:\work -Force | Out-Null
+          icacls C:\work /grant "RDP:(OI)(CI)M" | Out-Null
+          Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination C:\work -Recurse -Force
+
+      - name: Install dev tools (embedded + data analysis)
+        run: |
+          # Embedded: ARM GCC, QEMU, VS Code, PlatformIO
+          choco install -y --no-progress gcc-arm-embedded qemu vscode python311
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+          python -m pip install --upgrade pip
+          python -m pip install platformio
+          # Data analysis
+          python -m pip install jupyterlab pandas numpy scipy matplotlib pyserial
+          # Renode / Wokwi: not preinstalled. Wokwi = VS Code extension; Renode = install on demand.
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-         
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection
+      - name: Connect Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-         
-          # Wait for Tailscale to assign an IP
+          # Key must be ephemeral + tagged (tag:gh-runner). See README.
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=$env:TS_AUTHKEY `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID `
+            --advertise-tags=tag:gh-runner
+
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
               $retries++
           }
-         
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-         
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection + Watch RDP User
+      - name: Verify RDP reachable
+        run: |
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) { Write-Error "RDP port 3389 unreachable"; exit 1 }
+          Write-Host "RDP reachable on $env:TAILSCALE_IP"
+
+      - name: Keep session alive
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Address : $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Password: (secret RDP_PASSWORD)"
+          Write-Host "Work dir: C:\work  (uploaded as artifact at end)"
+          Write-Host "Stop early: create C:\work\STOP"
           Write-Host "==================`n"
 
-          $rdpProfile = "C:\Users\RDP"
-          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
-          $downloadPath = "$startupPath\Downloads.bat"
-
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
-
-                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "✅ Downloads.bat copied to $downloadPath"
-
-                      # Run the batch file for the first time
-                      cmd /c $downloadPath
-                      Write-Host "✅ Downloads.bat executed successfully"
-                      break
-                  }
-                  catch {
-                      Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      break
-                  }
-              }
-              else {
-                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-                  Start-Sleep -Seconds 30
-              }
+          $minutes = [Math]::Min([int]$env:SESSION_MINUTES, 335)
+          $end = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $end -and -not (Test-Path C:\work\STOP)) {
+              Start-Sleep -Seconds 30
           }
+          Write-Host "Session ending."
 
-          # Keep runner alive
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+      - name: Upload work dir
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-${{ github.run_id }}
+          path: C:\work
+          retention-days: 7
+          if-no-files-found: ignore
