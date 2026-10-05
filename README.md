@@ -43,6 +43,22 @@ Tailscale ACL (admin console) - allow only your devices to reach the tag:
 5. End early: create `C:\work\STOP`.
 6. Download the `workspace-<run_id>` artifact (kept 7 days).
 
+## Share files and folders
+
+Three ways, all Tailscale-only:
+
+**1. SMB share** (`C:\work` -> `\\<tailscale-ip>\work`, user `RDP`, password = `RDP_PASSWORD`). Best for folders and large transfers.
+
+- Windows: `net use W: \\<tailscale-ip>\work /user:RDP *`
+- Linux: `sudo mount -t cifs //<tailscale-ip>/work /mnt/work -o user=RDP,uid=$(id -u)`
+- macOS: Finder -> Go -> Connect to Server -> `smb://<tailscale-ip>/work`
+
+**2. RDP drive redirection.** mstsc -> Show Options -> Local Resources -> Local devices and resources -> More -> tick drives/folders. They appear in the session as `\\tsclient\<drive>`.
+
+**3. Clipboard.** Copy/paste files between your PC and the session in the RDP window.
+
+Anything outside `C:\work` is lost when the job ends. Copy it into `C:\work` to get it in the artifact.
+
 ## What gets installed
 
 - Embedded: ARM GCC, QEMU, VS Code, PlatformIO, pyserial
