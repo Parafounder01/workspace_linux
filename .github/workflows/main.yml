@@ -60,7 +60,7 @@ jobs:
           Set-ItemProperty -Path $rdp -Name "fDisableCdm"  -Value 0 -Force
           Set-ItemProperty -Path $rdp -Name "fDisableClip" -Value 0 -Force
 
-          # SMB share \\<tailscale-ip>\work -> C:\work
+          # SMB share \\<tailscale-host>\work -> C:\work
           Set-Service -Name LanmanServer -StartupType Automatic
           Start-Service -Name LanmanServer
           if (Get-SmbShare -Name "work" -ErrorAction SilentlyContinue) { Remove-SmbShare -Name "work" -Force }
@@ -85,31 +85,44 @@ jobs:
           python -m pip install opencv-contrib-python pillow scikit-image imageio tifffile imutils albumentations
           # Renode / Wokwi: not preinstalled. Wokwi = VS Code extension; Renode = install on demand.
 
-      - name: Install OpenCode Desktop + Verdent
+      - name: Install OpenCode (CLI + Desktop)
         continue-on-error: true   # a failed AI-tool download shouldn't kill the session
-        env:
-          # Verdent has no stable direct link; paste the .exe link from verdent.ai/download
-          # into a repo variable named VERDENT_INSTALLER_URL
-          VERDENT_INSTALLER_URL: ${{ vars.VERDENT_INSTALLER_URL }}
         run: |
           $dl = "C:\installers"
           New-Item -ItemType Directory -Path $dl -Force | Out-Null
 
-          # --- OpenCode: CLI (npm) + Desktop (GitHub release) ---
+          # CLI via npm
           choco install -y --no-progress nodejs-lts
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine")
           npm install -g opencode-ai@latest
 
-          $ocUrl = "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-windows-x64.exe"
-          Invoke-WebRequest -Uri $ocUrl -OutFile "$dl\opencode-desktop-windows-x64.exe"
-          Start-Process "$dl\opencode-desktop-windows-x64.exe" -ArgumentList "/S" -Wait
-
-          # --- Verdent ---
-          if ($env:VERDENT_INSTALLER_URL) {
-              Invoke-WebRequest -Uri $env:VERDENT_INSTALLER_URL -OutFile "$dl\verdent-setup.exe"
-              Start-Process "$dl\verdent-setup.exe" -ArgumentList "/S" -Wait
+          # Desktop (NSIS installer)
+          $ocUrl  = "https://opencode.ai/download/stable/windows-x64-nsis"
+          $ocFile = "$dl\opencode-desktop-setup.exe"
+          Invoke-WebRequest -Uri $ocUrl -OutFile $ocFile -UseBasicParsing
+          $head = [System.IO.File]::ReadAllBytes($ocFile)[0..1]
+          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+              Write-Warning "OpenCode download is not a Windows executable; skipping install."
           } else {
-              Write-Warning "VERDENT_INSTALLER_URL not set; skipping Verdent. Download it from verdent.ai/download inside the RDP session."
+              Start-Process $ocFile -ArgumentList "/S" -Wait
+              Write-Host "OpenCode Desktop installed."
+          }
+
+      - name: Install Verdent
+        continue-on-error: true
+        run: |
+          $dl = "C:\installers"
+          New-Item -ItemType Directory -Path $dl -Force | Out-Null
+
+          $vUrl  = "https://www.verdent.ai/api/verdent-download?platform=Windows"
+          $vFile = "$dl\verdent-setup.exe"
+          Invoke-WebRequest -Uri $vUrl -OutFile $vFile -UseBasicParsing -MaximumRedirection 10
+          $head = [System.IO.File]::ReadAllBytes($vFile)[0..1]
+          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+              Write-Warning "Verdent download is not a Windows executable; skipping install."
+          } else {
+              Start-Process $vFile -ArgumentList "/S" -Wait
+              Write-Host "Verdent installed (sign-in required inside the RDP session)."
           }
 
           # Let the non-admin RDP user run the installers if a silent install didn't cover them
@@ -128,9 +141,10 @@ jobs:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           # Key must be ephemeral + tagged (tag:gh-runner); node inherits the tag from the key.
+          # Fixed hostname -> connect to "gh-runner" via MagicDNS instead of the changing IP.
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=$env:TS_AUTHKEY `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID
+            --hostname=gh-runner
 
           $tsIP = $null
           $retries = 0
@@ -153,12 +167,13 @@ jobs:
           SESSION_MINUTES: ${{ inputs.session_minutes }}
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Host    : gh-runner  (MagicDNS)"
+          Write-Host "Address : $env:TAILSCALE_IP  (may change per run)"
           Write-Host "Username: RDP"
           Write-Host "Password: (secret RDP_PASSWORD)"
           Write-Host "Work dir: C:\work  (uploaded as artifact at end)"
           Write-Host "Installers: C:\installers  (OpenCode/Verdent setup files)"
-          Write-Host "SMB share: \\$env:TAILSCALE_IP\work  (user RDP)"
+          Write-Host "SMB share: \\gh-runner\work  (user RDP)"
           Write-Host "Stop early: create C:\work\STOP"
           Write-Host "==================`n"
 
@@ -168,6 +183,13 @@ jobs:
               Start-Sleep -Seconds 30
           }
           Write-Host "Session ending."
+
+      - name: Remove Tailscale node (free the hostname)
+        if: always()
+        run: |
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
+          }
 
       - name: Upload work dir
         if: always()
