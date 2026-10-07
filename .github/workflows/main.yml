@@ -1,6 +1,6 @@
 name: Dev workspace (Win 2022 + Tailscale RDP, software-only)
 
-# Software-only sessions: embedded firmware build/sim + data analysis.
+# Software-only sessions: embedded firmware build/sim + data analysis + CV/image processing + AI coding tools.
 # No hardware access. Anything needing a real board -> lab PC (see README.md).
 
 on:
@@ -71,7 +71,7 @@ jobs:
           netsh advfirewall firewall add rule name="SMB-Tailscale" `
             dir=in action=allow protocol=TCP localport=445 remoteip=100.64.0.0/10
 
-      - name: Install dev tools (embedded + data analysis)
+      - name: Install dev tools (embedded + data analysis + computer vision)
         run: |
           # Embedded: ARM GCC, QEMU, VS Code, PlatformIO
           choco install -y --no-progress gcc-arm-embedded qemu vscode python311
@@ -80,7 +80,40 @@ jobs:
           python -m pip install platformio
           # Data analysis
           python -m pip install jupyterlab pandas numpy scipy matplotlib pyserial
+          # Computer vision / image processing
+          # (contrib already includes the main OpenCV modules; don't install both packages)
+          python -m pip install opencv-contrib-python pillow scikit-image imageio tifffile imutils albumentations
           # Renode / Wokwi: not preinstalled. Wokwi = VS Code extension; Renode = install on demand.
+
+      - name: Install OpenCode Desktop + Verdent
+        continue-on-error: true   # a failed AI-tool download shouldn't kill the session
+        env:
+          # Verdent has no stable direct link; paste the .exe link from verdent.ai/download
+          # into a repo variable named VERDENT_INSTALLER_URL
+          VERDENT_INSTALLER_URL: ${{ vars.VERDENT_INSTALLER_URL }}
+        run: |
+          $dl = "C:\installers"
+          New-Item -ItemType Directory -Path $dl -Force | Out-Null
+
+          # --- OpenCode: CLI (npm) + Desktop (GitHub release) ---
+          choco install -y --no-progress nodejs-lts
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+          npm install -g opencode-ai@latest
+
+          $ocUrl = "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-windows-x64.exe"
+          Invoke-WebRequest -Uri $ocUrl -OutFile "$dl\opencode-desktop-windows-x64.exe"
+          Start-Process "$dl\opencode-desktop-windows-x64.exe" -ArgumentList "/S" -Wait
+
+          # --- Verdent ---
+          if ($env:VERDENT_INSTALLER_URL) {
+              Invoke-WebRequest -Uri $env:VERDENT_INSTALLER_URL -OutFile "$dl\verdent-setup.exe"
+              Start-Process "$dl\verdent-setup.exe" -ArgumentList "/S" -Wait
+          } else {
+              Write-Warning "VERDENT_INSTALLER_URL not set; skipping Verdent. Download it from verdent.ai/download inside the RDP session."
+          }
+
+          # Let the non-admin RDP user run the installers if a silent install didn't cover them
+          icacls $dl /grant "RDP:(OI)(CI)RX" | Out-Null
 
       - name: Install Tailscale
         run: |
@@ -124,6 +157,7 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: (secret RDP_PASSWORD)"
           Write-Host "Work dir: C:\work  (uploaded as artifact at end)"
+          Write-Host "Installers: C:\installers  (OpenCode/Verdent setup files)"
           Write-Host "SMB share: \\$env:TAILSCALE_IP\work  (user RDP)"
           Write-Host "Stop early: create C:\work\STOP"
           Write-Host "==================`n"
