@@ -1,5 +1,4 @@
-# Dev Workspace: Windows 2022 + Tailscale RDP
-
+# Dev Workspace: Windows 2022 + Tailscale RDP + Education purposes
 Temporary cloud desktop on a GitHub Actions runner, reachable only over Tailscale.
 **Software-only.** No USB/serial/JTAG access.
 
